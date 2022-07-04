@@ -1,0 +1,135 @@
+---
+storage:
+  files:
+    - path: /opt/bin/k8s-setup.sh
+      filesystem: root
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          modprobe br_netfilter
+          cat <<EOF | tee /etc/modules-load.d/k8s.conf
+          br_netfilter
+          EOF
+
+          cat <<EOF | tee /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          EOF
+          sysctl --system
+
+          ## Download required binaries and start kubelet
+          CNI_VERSION="${cni_version}"
+          CRICTL_VERSION="${crictl_version}"
+          RELEASE_VERSION="${release_version}"
+          DOWNLOAD_DIR=${download_dir}
+          RELEASE="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
+
+          mkdir -p /opt/cni/bin
+          mkdir -p /etc/systemd/system/kubelet.service.d
+
+          curl -sSL "https://github.com/containernetworking/plugins/releases/download/$${CNI_VERSION}/cni-plugins-linux-amd64-$${CNI_VERSION}.tgz" | tar -C /opt/cni/bin -xz
+          curl -sSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/$${CRICTL_VERSION}/crictl-$${CRICTL_VERSION}-linux-amd64.tar.gz" | tar -C $${DOWNLOAD_DIR} -xz
+          curl -sSL "https://raw.githubusercontent.com/kubernetes/release/$${RELEASE_VERSION}/cmd/kubepkg/templates/latest/deb/kubelet/lib/systemd/system/kubelet.service" | sed "s:/usr/bin:$${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service
+          curl -sSL "https://raw.githubusercontent.com/kubernetes/release/$${RELEASE_VERSION}/cmd/kubepkg/templates/latest/deb/kubeadm/10-kubeadm.conf" | sed "s:/usr/bin:$${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+          curl -sSL --remote-name-all https://storage.googleapis.com/kubernetes-release/release/$${RELEASE}/bin/linux/amd64/{kubeadm,kubelet,kubectl}
+
+          chmod +x {kubeadm,kubelet,kubectl}
+          mv {kubeadm,kubelet,kubectl} $${DOWNLOAD_DIR}/
+
+          systemctl enable --now kubelet
+          systemctl status kubelet
+
+
+
+          ## Initialize Kubeadm
+          PATH=$(echo $PATH:/opt/bin:/opt/cni/bin)
+
+          ### Get public hostname 
+          TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+          PUBLIC_HOSTNAME=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/public-hostname)
+          PRIVATE_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/local-ipv4)
+          cat <<EOF | tee kubeadm-config.yaml
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          nodeRegistration:
+            kubeletExtraArgs:
+              volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          networking:
+            podSubnet: 192.168.0.0/16
+          controllerManager:
+            extraArgs:
+              flex-volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
+          apiServer:
+            certSANs:
+              - $${PUBLIC_HOSTNAME}
+          ---
+          kind: KubeletConfiguration
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          cgroupDriver: $(docker info -f '{{.CgroupDriver}}')
+          EOF
+
+          kubeadm config images pull
+          kubeadm init --config kubeadm-config.yaml
+
+          sleep 60
+
+          mkdir -p $HOME/.kube
+          cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          mkdir -p /home/core/.kube
+          cp -i /etc/kubernetes/admin.conf /home/core/.kube/config
+          chmod 0755 /home/core/.kube/config
+
+          ## Replace private IP in kubeconfig to public dns address
+          sed -i "s|$${PRIVATE_IP}|$${PUBLIC_HOSTNAME}|g" /home/core/.kube/config
+
+          ## Install CNI
+
+          cat <<EOF | tee calico.yaml
+          # Source: https://docs.projectcalico.org/manifests/custom-resources.yaml
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            # Configures Calico networking.
+            calicoNetwork:
+              # Note: The ipPools section cannot be modified post-install.
+              ipPools:
+              - blockSize: 26
+                cidr: 192.168.0.0/16
+                encapsulation: VXLANCrossSubnet
+                natOutgoing: Enabled
+                nodeSelector: all()
+            flexVolumePath: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+            controlPlaneTolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                effect: NoSchedule
+          EOF
+          kubectl create -f https://docs.projectcalico.org/manifests/tigera-operator.yaml
+          kubectl apply -f calico.yaml
+          kubectl taint node $(hostname) node-role.kubernetes.io/master:NoSchedule-
+systemd:
+  units:
+  - name: docker.service
+    enabled: true
+  - name: k8s-setup.service
+    enabled: true
+    contents: |
+      [Unit]
+      User=root
+      Wants=docker.service network-online.target
+      After=network-online.target docker.service
+      Description="Run K8S Controller Bootstrap script"
+      ConditionPathExists=/opt/bin/k8s-setup.sh
+      [Service]
+      Type=forking
+      TimeoutStartSec=180
+      RemainAfterExit=yes
+      KillMode=process
+      ExecStart=/usr/bin/sh -c "/opt/bin/k8s-setup.sh"
+      [Install]
+      WantedBy=multi-user.target
