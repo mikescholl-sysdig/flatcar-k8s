@@ -1,53 +1,13 @@
-terraform {
-  required_version = ">= 0.13"
-  required_providers {
-    ct = {
-      source  = "poseidon/ct"
-      version = "0.7.1"
-    }
-    template = {
-      source  = "hashicorp/template"
-      version = "~> 2.2.0"
-    }
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.0.0"
-    }
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.0.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-
-data "aws_vpc" "this" {
-  id = "vpc-0430bd988526f6db3"
-}
-
-#data "aws_subnets" "this" {
-#  filter {
-#    name = "vpc-id"
-#    values = [data.aws_vpc.this.id]
-#  }
-#  filter {
-#    name = "tag:type"
-#    values = ["private"]
-#  }
-#}
-
 resource "aws_key_pair" "this" {
   key_name = var.ssh_key_name
   public_key = var.ssh_public_key
 }
 
 resource "aws_security_group" "this" {
-  vpc_id = data.aws_vpc.this.id
+  vpc_id = var.vpc_id
   tags = {
-    type = "private"
+    type = "private",
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
 }
 
@@ -70,39 +30,27 @@ resource "aws_security_group_rule" "incoming_any" {
 }
 
 
-data "aws_ami" "flatcar_stable_latest" {
-  most_recent = true
-  owners      = ["aws-marketplace"]
-
-  filter {
-    name   = "architecture"
-    values = ["x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "name"
-    values = ["Flatcar-stable-*"]
-  }
+resource "aws_iam_instance_profile" "controller" {
+  role = aws_iam_role.controller.name
+  name = "${var.cluster_name}-controller-instance-profile"
 }
 
 resource "aws_instance" "controller" {
   count = var.flatcar_controller_count
-  instance_type = var.instance_type
+  instance_type = var.controller_instance_type
   user_data     = data.ct_config.k8s-controller.rendered
+  iam_instance_profile = aws_iam_instance_profile.controller.name
   ami           = data.aws_ami.flatcar_stable_latest.image_id
   key_name      = aws_key_pair.this.key_name
-
   associate_public_ip_address = true
   subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.this.id]
-  
+  root_block_device {
+    volume_size = 100
+  }
   tags = {
-    Name = "${var.cluster_name}-${count.index}"
+    Name = "${var.cluster_name}-controller-${count.index}",
+     "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
   provisioner "remote-exec" {
     connection {
@@ -124,18 +72,27 @@ resource "aws_instance" "controller" {
   }
 }
 
+
 data "ct_config" "k8s-controller" {
   content  = data.template_file.k8s-controller.rendered
 }
 
 data "template_file" "k8s-controller" {
-  template = file("${path.module}/cl/k8s-controller.yaml.tmpl")
+  template = file("${path.module}/cl/${var.controller_template_name}.yaml.tmpl")
   vars = {
     cni_version = var.cni_version
     release_version = var.release_version
     crictl_version = var.crictl_version
     download_dir = var.download_dir
+    cluster_name = var.cluster_name
   }
 }
+
+resource "time_sleep" "wait_120_seconds" {
+  depends_on = [aws_instance.controller]
+  
+  create_duration = "120s"
+}
+
 
 

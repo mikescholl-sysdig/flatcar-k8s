@@ -2,8 +2,14 @@ variable "flatcar_controller_count" {
   type = string
   description = "Number of flatcar instances to create"
   default = "1"
-  
 }
+
+variable "flatcar_worker_count" {
+  type = string
+  description = "Number of flatcar instances to create"
+  default = "2"
+}
+
 variable "cluster_name" {
   type        = string
   description = "Cluster name used as prefix for the machine names"
@@ -35,7 +41,13 @@ variable "ssh_private_key" {
 
 variable "instance_type" {
   type        = string
-  default     = "t3.xlarge"
+  default     = "t3a.xlarge"
+  description = "Instance type for the machine"
+}
+
+variable "controller_instance_type" {
+  type        = string
+  default     = "t3.large"
   description = "Instance type for the machine"
 }
 
@@ -70,4 +82,20 @@ variable "kubeconfig_destination" {
 variable "subnet_id" {
   type = string
   description = "Subnet ID you wish to deploy flatcar node to."
+}
+
+variable "vpc_id" {
+  type = string
+  description = "VPC ID to create cluster on."
+}
+
+variable "worker_template_name" {
+  type = string
+  description = "String prefix to be used to locate template in the cl directory for workers"
+}
+
+variable "controller_template_name" {
+  type = string
+  description = "String prefix to be used to locate template in the cl directory for controllers"
+  
 }

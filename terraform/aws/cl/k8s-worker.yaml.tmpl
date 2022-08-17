@@ -1,0 +1,74 @@
+---
+storage:
+  files:
+    - path: /opt/bin/k8s-setup.sh
+      filesystem: root
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          modprobe br_netfilter
+          cat <<EOF | tee /etc/modules-load.d/k8s.conf
+          br_netfilter
+          EOF
+
+          cat <<EOF | tee /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          EOF
+          sysctl --system
+
+          ## Download required binaries and start kubelet
+          CNI_VERSION="${cni_version}"
+          CRICTL_VERSION="${crictl_version}"
+          RELEASE_VERSION="${release_version}"
+          DOWNLOAD_DIR=${download_dir}
+          RELEASE="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
+
+          mkdir -p /opt/cni/bin
+          mkdir -p /etc/systemd/system/kubelet.service.d
+
+          curl -sSL "https://github.com/containernetworking/plugins/releases/download/$${CNI_VERSION}/cni-plugins-linux-amd64-$${CNI_VERSION}.tgz" | tar -C /opt/cni/bin -xz
+          curl -sSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/$${CRICTL_VERSION}/crictl-$${CRICTL_VERSION}-linux-amd64.tar.gz" | tar -C $${DOWNLOAD_DIR} -xz
+          curl -sSL "https://raw.githubusercontent.com/kubernetes/release/$${RELEASE_VERSION}/cmd/kubepkg/templates/latest/deb/kubelet/lib/systemd/system/kubelet.service" | sed "s:/usr/bin:$${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service
+          curl -sSL "https://raw.githubusercontent.com/kubernetes/release/$${RELEASE_VERSION}/cmd/kubepkg/templates/latest/deb/kubeadm/10-kubeadm.conf" | sed "s:/usr/bin:$${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+          curl -sSL --remote-name-all https://storage.googleapis.com/kubernetes-release/release/$${RELEASE}/bin/linux/amd64/{kubeadm,kubelet,kubectl}
+
+          chmod +x {kubeadm,kubelet,kubectl}
+          mv {kubeadm,kubelet,kubectl} $${DOWNLOAD_DIR}/
+
+          ## Initialize Kubeadm
+          PATH=$(echo $PATH:/opt/bin:/opt/cni/bin)
+
+          systemctl enable --now kubelet
+          systemctl status kubelet
+
+          ### Get parameter for install command ###
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install --install-dir /opt/bin/aws-cli --bin-dir /opt/bin
+
+          JOIN_COMMAND=$(/opt/bin/aws ssm get-parameter --name flatcar-k8s-join-command | jq -r .Parameter.Value)
+          $(echo $${JOIN_COMMAND} -v5)
+
+systemd:
+  units:
+  - name: containerd.service
+    enabled: true
+  - name: k8s-setup.service
+    enabled: true
+    contents: |
+      [Unit]
+      User=root
+      Wants=containerd.service network-online.target
+      After=network-online.target containerd.service
+      Description="Run K8S Controller Bootstrap script"
+      ConditionPathExists=/opt/bin/k8s-setup.sh
+      [Service]
+      Type=forking
+      TimeoutStartSec=180
+      RemainAfterExit=yes
+      KillMode=process
+      ExecStart=/usr/bin/sh -c "/opt/bin/k8s-setup.sh"
+      [Install]
+      WantedBy=multi-user.target

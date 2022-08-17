@@ -1,22 +1,46 @@
 ---
 storage:
   files:
+    - path: /etc/cloud-controller-aws-values.yaml
+      filesystem: root
+      mode: 0755
+      contents: 
+        inline: |
+          args:
+            - --v=2
+            - --cloud-provider=aws
+            - --cluster-name=${cluster_name}
+            - --cluster-cidr=192.168.0.0/16
+            - --allocate-node-cidrs=true
+            - --configure-cloud-routes=false
+          resources:
+             limits:
+               cpu: 500m
+               memory: 512Mi
+             requests:
+               cpu: 200m
+               memory: 512Mi
     - path: /opt/bin/k8s-setup.sh
       filesystem: root
       mode: 0755
       contents:
         inline: |
           #!/bin/bash
-          modprobe br_netfilter
-          cat <<EOF | tee /etc/modules-load.d/k8s.conf
+          cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+          overlay
           br_netfilter
           EOF
-
-          cat <<EOF | tee /etc/sysctl.d/k8s.conf
+          sudo modprobe overlay
+          sudo modprobe br_netfilter
+          # sysctl params required by setup, params persist across reboots
+          cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-iptables  = 1
           net.bridge.bridge-nf-call-ip6tables = 1
-          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward                 = 1
           EOF
-          sysctl --system
+          
+          # Apply sysctl params without reboot
+          sudo sysctl --system
 
           ## Download required binaries and start kubelet
           CNI_VERSION="${cni_version}"
@@ -40,41 +64,59 @@ storage:
           systemctl enable --now kubelet
           systemctl status kubelet
 
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          export HELM_INSTALL_DIR=/opt/bin
+          ./get_helm.sh
 
 
           ## Initialize Kubeadm
           PATH=$(echo $PATH:/opt/bin:/opt/cni/bin)
 
-          ### Get public hostname 
+          HOSTNAME_LONG=$(hostname -f)
+          hostname $(echo $HOSTNAME_LONG)
           TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+          AZ=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/placement/availability-zone)
+          INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/instance-id)
+
+          ### Get public hostname 
           PUBLIC_HOSTNAME=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/public-hostname)
           PRIVATE_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/local-ipv4)
+          
+          
           cat <<EOF | tee kubeadm-config.yaml
           apiVersion: kubeadm.k8s.io/v1beta3
           kind: InitConfiguration
           nodeRegistration:
+            name: "$${HOSTNAME_LONG}"
             kubeletExtraArgs:
               volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
               cloud-provider: aws
+              provider-id: aws://$${AZ}/$${INSTANCE_ID}
+            taints:
+              - key: "node.cilium.io/agent-not-ready"
+                effect: "NoSchedule"
           ---
           apiVersion: kubeadm.k8s.io/v1beta3
           kind: ClusterConfiguration
           networking:
             podSubnet: 192.168.0.0/16
+            serviceSubnet: 10.96.0.0/12
+          clusterName: ${cluster_name}
           controllerManager:
             extraArgs:
-              cloud-provider: aws
               flex-volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
+              cloud-provider: "external"
           apiServer:
             certSANs:
               - $${PUBLIC_HOSTNAME}
-          ---
-          kind: KubeletConfiguration
-          apiVersion: kubelet.config.k8s.io/v1beta1
-          cgroupDriver: systemd
+            extraArgs:
+              cloud-provider: "external"
           EOF
 
           kubeadm config images pull
+          
+          ###KUBELET_KUBEADM_ARGS="--register-with-taints=\"node.cilium.io/agent-not-ready=NoSchedule\""
           kubeadm init --config kubeadm-config.yaml
 
           sleep 60
@@ -88,40 +130,36 @@ storage:
           ## Replace private IP in kubeconfig to public dns address
           sed -i "s|$${PRIVATE_IP}|$${PUBLIC_HOSTNAME}|g" /home/core/.kube/config
 
-          ## Install CNI
+          ## Install CNI and other add-ons
 
-          cat <<EOF | tee calico.yaml
-          # Source: https://docs.projectcalico.org/manifests/custom-resources.yaml
-          apiVersion: operator.tigera.io/v1
-          kind: Installation
-          metadata:
-            name: default
-          spec:
-            # Configures Calico networking.
-            calicoNetwork:
-              # Note: The ipPools section cannot be modified post-install.
-              ipPools:
-              - blockSize: 26
-                cidr: 192.168.0.0/16
-                ipipMode: Always
-                natOutgoing: Enabled
-                nodeSelector: all()
-            flexVolumePath: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
-            controlPlaneTolerations:
-              - key: "node-role.kubernetes.io/control-plane"
-                effect: NoSchedule
-          EOF
-          kubectl create -f https://docs.projectcalico.org/manifests/tigera-operator.yaml
-          kubectl apply -f calico.yaml
-          kubectl taint node $(hostname) node-role.kubernetes.io/master-
+          KUBECONFIG=/etc/kubernetes/admin.conf
+          helm repo add cilium https://helm.cilium.io/
+          helm repo add aws-cloud-controller-manager https://kubernetes.github.io/cloud-provider-aws
+          helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+          helm repo update
+          helm install cilium cilium/cilium --namespace kube-system --version 1.11.6 --set ipam.mode=kubernetes
+
+          git clone https://github.com/frezbo/cloud-provider-aws.git /etc/cloud-provider-aws
+          cd /etc/cloud-provider-aws
+          git checkout chore/add-k8s-1.24-taints
+          cd /
+
+          helm install aws-cloud-controller-manager /etc/cloud-provider-aws/charts/aws-cloud-controller-manager -n kube-system -f /etc/cloud-controller-aws-values.yaml
+          helm upgrade --install aws-ebs-csi-driver --namespace kube-system aws-ebs-csi-driver/aws-ebs-csi-driver --set node.tolerateAllTaints=true --set controller.tolerations[0].key="node-role\.kubernetes\.io/control-plane",controller.tolerations[0].operator=Exists
 
           ### Set parameter for install command ###
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
+          unzip -qq awscliv2.zip
           ./aws/install --install-dir /opt/bin/aws-cli --bin-dir /opt/bin
 
           JOIN_COMMAND=$(kubeadm token create --print-join-command --ttl 0)
-          aws ssm put-parameter --name flatcar-k8s-join-command --value "$${JOIN_COMMAND}" --type String --overwrite
+          CLUSTER_CA_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
+          CLUSTER_ENDPOINT="$(hostname -f):6443"
+          CLUSTER_TOKEN=$(kubeadm token create --ttl 0)
+          aws ssm put-parameter --name ${cluster_name}-ca-hash --value "$${CLUSTER_CA_HASH}" --type String --overwrite
+          aws ssm put-parameter --name ${cluster_name}-endpoint --value "$${CLUSTER_ENDPOINT}" --type String --overwrite
+          aws ssm put-parameter --name ${cluster_name}-token --value "$${CLUSTER_TOKEN}" --type String --overwrite
+          aws ssm put-parameter --name ${cluster_name}-join --value "$${JOIN_COMMAND}" --type String --overwrite
 
 systemd:
   units:
